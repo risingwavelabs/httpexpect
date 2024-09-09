@@ -36,11 +36,12 @@ type Request struct {
 	redirectPolicy RedirectPolicy
 	maxRedirects   int
 
-	retryPolicy   RetryPolicy
-	maxRetries    int
-	minRetryDelay time.Duration
-	maxRetryDelay time.Duration
-	sleepFn       func(d time.Duration) <-chan time.Time
+	retryPolicy     RetryPolicy
+	retryPolicyFunc func(resp *http.Response, err error) bool
+	maxRetries      int
+	minRetryDelay   time.Duration
+	maxRetryDelay   time.Duration
+	sleepFn         func(d time.Duration) <-chan time.Time
 
 	timeout time.Duration
 
@@ -728,6 +729,9 @@ const (
 // Whether a request is retried depends on error type (if any), response
 // status code (if any), and retry policy.
 //
+// Retry policy will be ignored when custom retry policy func is
+// specified.
+//
 // How much retry attempts happens is defined by WithMaxRetries().
 // How much to wait between attempts is defined by WithRetryDelay().
 //
@@ -756,6 +760,42 @@ func (r *Request) WithRetryPolicy(policy RetryPolicy) *Request {
 	}
 
 	r.retryPolicy = policy
+
+	return r
+}
+
+// WithRetryPolicyFunc sets a custom function for retries.
+//
+// Whether a request is retried depends on the output of the poliy
+// function with error type (if any) and  response status code (if
+// any) as inputs.
+//
+// How much retry attempts happens is defined by WithMaxRetries().
+// How much to wait between attempts is defined by WithRetryDelay().
+//
+// If retryPolicyFunc is nil, retry policy will be used.
+//
+// Example:
+//
+//	req := NewRequestC(config, "POST", "/path")
+//	req.WithRetryPolicy(RetryAllErrors)
+//	req.Expect().Status(http.StatusOK)
+func (r *Request) WithRetryPolicyFunc(policyFunc func(resp *http.Response, err error) bool) *Request {
+	opChain := r.chain.enter("WithRetryPolicyFunc()")
+	defer opChain.leave()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if opChain.failed() {
+		return r
+	}
+
+	if !r.checkOrder(opChain, "WithRetryPolicy()") {
+		return r
+	}
+
+	r.retryPolicyFunc = policyFunc
 
 	return r
 }
@@ -2332,6 +2372,9 @@ func (r *Request) retryRequest(reqFunc func() (*http.Response, error)) (
 }
 
 func (r *Request) shouldRetry(resp *http.Response, err error) bool {
+	if r.retryPolicyFunc != nil {
+		return r.retryPolicyFunc(resp, err)
+	}
 	var (
 		isTemporaryNetworkError bool // Deprecated
 		isTimeoutError          bool
